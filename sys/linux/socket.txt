@@ -46,7 +46,7 @@ socket_type = SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_SEQPACKET, SOCK_
 accept_flags = SOCK_NONBLOCK, SOCK_CLOEXEC
 shutdown_flags = SHUT_RD, SHUT_WR
 send_flags = MSG_CONFIRM, MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PROBE, MSG_BATCH, MSG_FASTOPEN, MSG_ZEROCOPY
-recv_flags = MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_WAITFORONE
+recv_flags = MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_WAITFORONE, MSG_SOCK_DEVMEM
 cmsg_levels = SOL_SOCKET, IPPROTO_ICMP, SOL_IP, SOL_TCP, SOL_UDP, SOL_IPV6, SOL_ICMPV6, SOL_SCTP, SOL_UDPLITE, SOL_RAW, SOL_AX25, SOL_ATALK, SOL_NETROM, SOL_ROSE, SOL_PACKET, SOL_ATM, SOL_AAL, SOL_IRDA, SOL_NETBEUI, SOL_LLC, SOL_DCCP, SOL_NETLINK, SOL_TIPC, SOL_RXRPC, SOL_PPPOL2TP, SOL_BLUETOOTH, SOL_PNPIPE, SOL_RDS, SOL_IUCV, SOL_CAIF, SOL_ALG, SOL_NFC, SOL_KCM
 
 sock_pair {
@@ -162,12 +162,36 @@ mmsghdr_sock {
 	msg_len	const[0, int32]
 }
 
+# Struct definitions from ncdevmem for SO_DEVMEM
+# Argument for setsockopt(SO_DEVMEM_DONTNEED, ...)
+# Corresponds to 'struct dmabuf_token' in ncdevmem.c
+dmabuf_token {
+	token_start	int32
+	token_count	int32
+}
+
+# Data received in a cmsg for SCM_DEVMEM_DMABUF/LINEAR
+# Corresponds to 'struct dmabuf_cmsg' with correct field order and all members
+dmabuf_cmsg {
+	frag_offset	int64
+	frag_size	int32
+	frag_token	int32
+	dmabuf_id	int32
+	flags		int32
+}
+
+# Control messages that can be RECEIVED with recvmsg
+recv_cmsghdr [
+	devmem_dmabuf	cmsghdr_t[SOL_SOCKET, SCM_DEVMEM_DMABUF, dmabuf_cmsg]
+	devmem_linear	cmsghdr_t[SOL_SOCKET, SCM_DEVMEM_LINEAR, dmabuf_cmsg]
+] [varlen]
+
 recv_msghdr {
 	msg_name	ptr[out, sockaddr_storage, opt]
 	msg_namelen	len[msg_name, int32]
 	msg_iov		ptr[in, array[iovec_out]]
 	msg_iovlen	len[msg_iov, intptr]
-	msg_control	ptr[out, array[int8], opt]
+	msg_control	ptr[out, array[recv_cmsghdr], opt]
 	msg_controllen	bytesize[msg_control, intptr]
 	msg_flags	const[0, int32]
 }
@@ -200,7 +224,11 @@ cmsghdr_sock [
 	mark		cmsghdr_t[SOL_SOCKET, SO_MARK, int32]
 	timestamping	cmsghdr_t[SOL_SOCKET, SO_TIMESTAMPING_OLD, int32]
 	txtime		cmsghdr_t[SOL_SOCKET, SCM_TXTIME, int64]
+	devmem_dmabuf	cmsghdr_t[SOL_SOCKET, SCM_DEVMEM_DMABUF, int32]
 ] [varlen]
+
+# Add the new setsockopt variant for SO_DEVMEM_DONTNEED
+setsockopt$devmem_dontneed(fd sock, level const[SOL_SOCKET], optname const[SO_DEVMEM_DONTNEED], optval ptr[in, dmabuf_token], optlen len[optval])
 
 # Socket options
 
