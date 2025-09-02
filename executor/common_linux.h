@@ -6062,3 +6062,94 @@ static long syz_kfuzztest_run(volatile long test_name_ptr, volatile long input_d
 }
 
 #endif
+
+#if SYZ_EXECUTOR || __NR_syz_bind_tx_udmabuf
+/*
+ * C implementation of the syz_bind_tx_udmabuf pseudo-syscall.
+ */
+#include <linux/genetlink.h>
+#include <linux/netlink.h>
+#include <net/if.h>
+#include <sys/socket.h>
+
+enum {
+	NETDEV_A_DMABUF_IFINDEX = 1,
+	NETDEV_A_DMABUF_QUEUES,
+	NETDEV_A_DMABUF_FD,
+	NETDEV_A_DMABUF_ID,
+};
+enum {
+	NETDEV_CMD_BIND_TX = 15,
+};
+
+static __attribute__((unused)) long syz_bind_tx_udmabuf(volatile long nl_sock_fd_long, volatile long udmabuf_fd_long)
+{
+	int nl_sock_fd = (int)nl_sock_fd_long;
+	int udmabuf_fd = (int)udmabuf_fd_long;
+
+	char tx_buf[4096], rx_buf[4096];
+	long family_id = 0;
+	long tx_dmabuf_id = -1;
+
+	unsigned int ifindex = if_nametoindex(syz_devmem_iface1);
+	if (!ifindex) {
+		debug("syz_bind_tx_udmabuf: failed to find ifindex for %s\n", syz_devmem_iface1);
+		return -ENODEV;
+	}
+
+	struct nlmsg nlmsg_tmp;
+	family_id = netlink_query_family_id(&nlmsg_tmp, nl_sock_fd, "netdev", false);
+	if (family_id < 0) {
+		return family_id;
+	}
+
+	/* Send the BIND_TX command */
+	memset(tx_buf, 0, sizeof(tx_buf));
+	struct nlmsghdr* nlh = (struct nlmsghdr*)tx_buf;
+	nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	nlh->nlmsg_type = family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq = 2;
+
+	struct genlmsghdr* gnlh = (struct genlmsghdr*)NLMSG_DATA(nlh);
+	gnlh->cmd = NETDEV_CMD_BIND_TX;
+	struct rtattr* rta = (struct rtattr*)((char*)gnlh + GENL_HDRLEN);
+	rta->rta_type = NETDEV_A_DMABUF_IFINDEX;
+	rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+	*(uint32_t*)RTA_DATA(rta) = ifindex;
+	nlh->nlmsg_len += rta->rta_len;
+	rta = (struct rtattr*)((char*)rta + RTA_ALIGN(rta->rta_len));
+	rta->rta_type = NETDEV_A_DMABUF_FD;
+	rta->rta_len = RTA_LENGTH(sizeof(int32_t));
+	*(int32_t*)RTA_DATA(rta) = udmabuf_fd;
+	nlh->nlmsg_len += rta->rta_len;
+
+	if (syscall(__NR_sendto, nl_sock_fd, nlh, nlh->nlmsg_len, 0, NULL, 0) < 0) {
+		return -errno;
+	}
+
+	/* Receive and parse the response */
+	syscall(__NR_recvfrom, nl_sock_fd, rx_buf, sizeof(rx_buf), 0, NULL, 0);
+	nlh = (struct nlmsghdr*)rx_buf;
+	if (nlh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr* err = (struct nlmsgerr*)NLMSG_DATA(nlh);
+		return err->error;
+	}
+
+	gnlh = (struct genlmsghdr*)NLMSG_DATA(nlh);
+	rta = (struct rtattr*)((char*)gnlh + GENL_HDRLEN);
+	int len = nlh->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+	for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if (rta->rta_type == NETDEV_A_DMABUF_ID) {
+			tx_dmabuf_id = *(uint32_t*)RTA_DATA(rta);
+			break;
+		}
+	}
+
+	if (tx_dmabuf_id < 0) {
+		return -ENOENT;
+	}
+
+	return tx_dmabuf_id;
+}
+#endif
