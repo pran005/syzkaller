@@ -1,0 +1,43 @@
+#
+# syzkaller test program for devmem TCP TX.
+#
+# The program sets up a dummy TCP server in a background thread
+# to allow the main client part of the program to connect successfully.
+#
+
+# Server setup: socket, bind, listen.
+r0 = socket(0x2, 0x1, 0x0)
+setsockopt(r0, 0x1, 0x2, &AUTO='\x01\x00\x00\x00', 0x4)
+setsockopt(r0, 0x1, 0x13, &AUTO='nsb\x00', 0x4)
+bind$inet(r0, &AUTO={0x2, 0x04d2, @rand_addr=0xc0a86402}, 0x10)
+listen(r0, 0x1)
+
+# The accept call is blocking. Syzkaller will execute it in a background
+# thread and continue with the next syscalls in the main thread.
+accept(r0, 0x0, 0x0)
+
+# Client setup
+r2 = memfd_create(&AUTO='tx-buffer\x00', 0x3)
+ftruncate(r2, 0x1000)
+fcntl$addseals(r2, 0x409, 0x2) # F_ADD_SEALS , F_SEAL_SHRINK
+
+# Create a udmabuf
+r3 = openat$udambuf(0xffffffffffffff9c, &AUTO='/dev/udmabuf\x00', 0x2)
+r4 = ioctl$UDMABUF_CREATE(r3, 0x40105500, &AUTO={r2, 0x0, 0x0, 0x1000})
+
+# Create a netlink socket and bind the udmabuf.
+r5 = socket$nl(0x10, 0x3, 0x10)
+r6 = syz_bind_tx_udmabuf(r5, r4)
+
+# Create a TCP socket.
+r1 = socket(0x2, 0x1, 0x0)
+setsockopt(r1, 0x1, 0x2d, &AUTO='\x01\x00\x00\x00', 0x4)
+setsockopt(r1, 0x1, 0x13, &AUTO='nsa\x00', 0x4)
+
+# Bind and connect.
+bind$inet(r1, &AUTO={0x2, 0x0, @rand_addr=0xc0a86401}, 0x10)
+connect$inet(r1, &AUTO={0x2, 0x04d2, @rand_addr=0xc0a86402}, 0x10)
+
+# Send a message using the bound devmem.
+sendmsg$devmem_tx(r1, &AUTO={0x0, 0x0, &AUTO={0x0, 0x400}, 0x1, &AUTO={0x14, 0x1, 0x4f, r6}, 0x14, 0x0}, 0x40000000)
+

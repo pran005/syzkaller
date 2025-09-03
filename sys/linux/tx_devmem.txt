@@ -1,0 +1,37 @@
+include <linux/socket.h>
+
+resource fd_nl_sock[fd]
+resource dmabuf_id[int32]
+
+socket$nl(domain const[16], type int32, protocol int32) fd_nl_sock
+
+#
+# The pseudo-syscall for the Tx bind netlink operation.
+# Accpets the netlink socket and dma-buf fd, and returns the dmabuf_id.
+#
+syz_bind_tx_udmabuf(nl_sock fd_nl_sock, dma_buf fd_dma_buf) dmabuf_id
+
+# cmsghdr structure for the final sendmsg call.
+cmsghdr_devmem_tx {
+	cmsg_len	const[20, int64]
+	cmsg_level	const[1, int64]
+	cmsg_type	const[79, int64]
+	cmsg_data	dmabuf_id
+}
+
+iovec_devmem_tx {
+	iov_base	const[0, intptr]
+	iov_len		int64
+}
+
+msghdr_devmem_tx {
+	msg_name	ptr[in, sockaddr_in, opt]
+	msg_namelen	len[msg_name, int32]
+	msg_iov		ptr[in, iovec_devmem_tx]
+	msg_iovlen	const[1, int64]
+	msg_control	ptr[in, cmsghdr_devmem_tx]
+	msg_controllen	len[msg_control, int32]
+	msg_flags	flags[send_flags, int32]
+}
+
+sendmsg$devmem_tx(fd sock, msg ptr[in, msghdr_devmem_tx], f flags[send_flags])
