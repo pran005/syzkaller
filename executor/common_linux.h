@@ -1474,6 +1474,141 @@ static void netlink_nicvf_setup(void)
 }
 #endif // SYZ_NIC_VF
 
+// For storing the if names for syz_bind_tx_udmabuf
+static char syz_devmem_iface1[IFNAMSIZ];
+static char syz_devmem_iface2[IFNAMSIZ];
+
+// Creates a pair of peered netdevsim devices in separate network namespaces.
+static int initialize_devmem_netdevices(void)
+{
+#if SYZ_EXECUTOR
+	if (!flag_net_devices)
+		return -1;
+#endif
+	int init_netns = -1, ns1_fd = -1, ns2_fd = -1, sock = -1;
+	int ifindex1 = -1, ifindex2 = -1;
+	char bus_name1[32], bus_name2[32];
+	char iface1_tmp[IFNAMSIZ], iface2_tmp[IFNAMSIZ];
+
+	int id1 = 10000 + (int)procid;
+	int id2 = 20000 + (int)procid;
+
+	snprintf(bus_name1, sizeof(bus_name1), "netdevsim%d", id1);
+	snprintf(bus_name2, sizeof(bus_name2), "netdevsim%d", id2);
+	snprintf(iface1_tmp, sizeof(iface1_tmp), "nsa");
+	snprintf(iface2_tmp, sizeof(iface2_tmp), "nsb");
+
+	// Get a handle to the initial namespace.
+	init_netns = open("/proc/self/ns/net", O_RDONLY);
+	if (init_netns < 0)
+		goto error;
+
+	// Create the netdevsim bus devices.
+	if (!write_file("/sys/bus/netdevsim/new_device", "%d 1", id1))
+		goto error;
+	if (!write_file("/sys/bus/netdevsim/new_device", "%d 1", id2))
+		goto error;
+
+	// Find and rename the netdevsims
+	initialize_devlink_ports("netdevsim", bus_name1, "nsa");
+	initialize_devlink_ports("netdevsim", bus_name2, "nsb");
+
+	// Create the network namespaces.
+	if (unshare(CLONE_NEWNET))
+		goto error;
+	ns1_fd = open("/proc/self/ns/net", O_RDONLY);
+	if (ns1_fd < 0)
+		goto error;
+	if (setns(init_netns, CLONE_NEWNET))
+		goto error;
+
+	if (unshare(CLONE_NEWNET))
+		goto error;
+	ns2_fd = open("/proc/self/ns/net", O_RDONLY);
+	if (ns2_fd < 0)
+		goto error;
+	if (setns(init_netns, CLONE_NEWNET))
+		goto error;
+
+	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock < 0)
+		goto error;
+
+	// Move devices to their namespaces.
+	struct ifinfomsg hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.ifi_index = if_nametoindex(iface1_tmp);
+	if (hdr.ifi_index == 0)
+		goto error;
+	netlink_init(&nlmsg, RTM_NEWLINK, 0, &hdr, sizeof(hdr));
+	netlink_attr(&nlmsg, IFLA_NET_NS_FD, &ns1_fd, sizeof(ns1_fd));
+	if (netlink_send(&nlmsg, sock) < 0)
+		goto error;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.ifi_index = if_nametoindex(iface2_tmp);
+	if (hdr.ifi_index == 0)
+		goto error;
+	netlink_init(&nlmsg, RTM_NEWLINK, 0, &hdr, sizeof(hdr));
+	netlink_attr(&nlmsg, IFLA_NET_NS_FD, &ns2_fd, sizeof(ns2_fd));
+	if (netlink_send(&nlmsg, sock) < 0)
+		goto error;
+
+	// Peer the devices.
+	if (setns(ns1_fd, CLONE_NEWNET))
+		goto error;
+	ifindex1 = if_nametoindex(iface1_tmp);
+	if (setns(init_netns, CLONE_NEWNET))
+		goto error;
+
+	if (setns(ns2_fd, CLONE_NEWNET))
+		goto error;
+	ifindex2 = if_nametoindex(iface2_tmp);
+	if (setns(init_netns, CLONE_NEWNET))
+		goto error;
+
+	char peer_str[128];
+	snprintf(peer_str, sizeof(peer_str), "%d:%d %d:%d", ns1_fd, ifindex1, ns2_fd, ifindex2);
+	if (!write_file("/sys/bus/netdevsim/link_device", peer_str))
+		goto error;
+
+	// Configure devices.
+	if (setns(ns1_fd, CLONE_NEWNET))
+		goto error;
+	netlink_add_addr4(&nlmsg, sock, iface1_tmp, "192.168.100.1");
+	netlink_device_change(&nlmsg, sock, iface1_tmp, true, 0, 0, 0, NULL);
+	if (setns(init_netns, CLONE_NEWNET))
+		goto error;
+
+	if (setns(ns2_fd, CLONE_NEWNET))
+		goto error;
+	netlink_add_addr4(&nlmsg, sock, iface2_tmp, "192.168.100.2");
+	netlink_device_change(&nlmsg, sock, iface2_tmp, true, 0, 0, 0, NULL);
+	if (setns(init_netns, CLONE_NEWNET))
+		goto error;
+
+	// Success. Store results and return ns1_fd.
+	snprintf(syz_devmem_iface1, IFNAMSIZ, "%s", iface1_tmp);
+	snprintf(syz_devmem_iface2, IFNAMSIZ, "%s", iface2_tmp);
+
+	close(sock);
+	close(init_netns);
+	close(ns2_fd);
+	return ns1_fd;
+
+error:
+	debug("initialize_devmem_netdevices failed: %d\n", errno);
+	if (init_netns > 0)
+		close(init_netns);
+	if (ns1_fd > 0)
+		close(ns1_fd);
+	if (ns2_fd > 0)
+		close(ns2_fd);
+	if (sock > 0)
+		close(sock);
+	return -1;
+}
+
 // We test in a separate namespace, which does not have any network devices initially (even lo).
 // Create/up as many as we can.
 static void initialize_netdevices(void)
@@ -4202,8 +4337,15 @@ static int do_sandbox_none(void)
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 	initialize_netdevices_init();
 #endif
-	if (unshare(CLONE_NEWNET)) {
-		debug("unshare(CLONE_NEWNET): %d\n", errno);
+	int devmem_ns_fd = initialize_devmem_netdevices();
+	if (devmem_ns_fd != -1) {
+		if (setns(devmem_ns_fd, CLONE_NEWNET))
+			fail("setns(devmem_ns_fd) failed");
+		close(devmem_ns_fd);
+	} else {
+		if (unshare(CLONE_NEWNET)) {
+			debug("unshare(CLONE_NEWNET): %d\n", errno);
+		}
 	}
 	// Enable access to IPPROTO_ICMP sockets, must be done after CLONE_NEWNET.
 	write_file("/proc/sys/net/ipv4/ping_group_range", "0 65535");
@@ -4247,8 +4389,15 @@ static int do_sandbox_setuid(void)
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 	initialize_netdevices_init();
 #endif
-	if (unshare(CLONE_NEWNET)) {
-		debug("unshare(CLONE_NEWNET): %d\n", errno);
+	int devmem_ns_fd = initialize_devmem_netdevices();
+	if (devmem_ns_fd != -1) {
+		if (setns(devmem_ns_fd, CLONE_NEWNET))
+			fail("setns(devmem_ns_fd) failed");
+		close(devmem_ns_fd);
+	} else {
+		if (unshare(CLONE_NEWNET)) {
+			debug("unshare(CLONE_NEWNET): %d\n", errno);
+		}
 	}
 #if SYZ_EXECUTOR || SYZ_DEVLINK_PCI
 	initialize_devlink_pci();
@@ -4309,9 +4458,16 @@ static int namespace_sandbox_proc(void* arg)
 	initialize_netdevices_init();
 #endif
 	// CLONE_NEWNET must always happen before tun setup,
-	// because we want the tun device in the test namespace.
-	if (unshare(CLONE_NEWNET))
-		fail("unshare(CLONE_NEWNET)");
+	// because we want the tun device in the test net namespace.
+	int devmem_ns_fd = initialize_devmem_netdevices();
+	if (devmem_ns_fd != -1) {
+		if (setns(devmem_ns_fd, CLONE_NEWNET))
+			fail("setns(devmem_ns_fd) failed");
+		close(devmem_ns_fd);
+	} else {
+		if (unshare(CLONE_NEWNET))
+			fail("unshare(CLONE_NEWNET)");
+	}
 	// Enable access to IPPROTO_ICMP sockets, must be done after CLONE_NEWNET.
 	write_file("/proc/sys/net/ipv4/ping_group_range", "0 65535");
 #if SYZ_EXECUTOR || SYZ_DEVLINK_PCI
